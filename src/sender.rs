@@ -12,9 +12,38 @@ use hickory_proto::{
     },
 };
 use rand::{rng, RngExt};
-use std::{collections::BTreeMap, net::IpAddr, str::FromStr, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+    str::FromStr,
+    time::Duration,
+};
 
 const RESPONSE_DELAY: Duration = Duration::from_millis(100);
+
+/// The distinct peers seen answering during one response window.
+///
+/// Response suppression must count responders, not packets: the same
+/// announcement can be received several times (once per interface on
+/// multi-homed hosts), and our own announcements loop back as well.
+/// Counting packets lets such duplicates reach the cutoff almost
+/// immediately, chronically suppressing the slower peers.
+#[derive(Default)]
+struct Responders(BTreeSet<String>);
+
+impl Responders {
+    /// Records the peers named in one received response, ignoring our own ID.
+    ///
+    /// Returns the number of distinct responders seen so far in this window.
+    fn note(&mut self, resp: &BTreeMap<String, Peer>, own_id: &str) -> u32 {
+        for peer_id in resp.keys() {
+            if peer_id != own_id {
+                self.0.insert(peer_id.clone());
+            }
+        }
+        self.0.len() as u32
+    }
+}
 
 pub enum MdnsMsg {
     QueryV4,
@@ -115,15 +144,15 @@ pub async fn sender(
             me.send(MdnsMsg::Timeout(timeout_count));
         });
 
-        let mut response_count = 0;
+        let mut responders = Responders::default();
         has_responded = false;
         loop {
             if let ActoInput::Message(msg) = ctx.recv().await {
                 match msg {
                     MdnsMsg::Response(resp) => {
-                        response_count += resp.len() as u32;
+                        let distinct = responders.note(&resp, &discoverer.peer_id);
                         updater.send(updater::Input::Peers(resp));
-                        if response_count >= cutoff {
+                        if distinct >= cutoff {
                             timeout.abort();
                             break;
                         }
@@ -288,5 +317,39 @@ fn update_response(
             // Interface changes don't affect the response content
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resp(peer_ids: &[&str]) -> BTreeMap<String, Peer> {
+        peer_ids
+            .iter()
+            .map(|id| (id.to_string(), Peer::new()))
+            .collect()
+    }
+
+    #[test]
+    fn duplicate_copies_of_a_response_count_once() {
+        let mut responders = Responders::default();
+        assert_eq!(responders.note(&resp(&["a"]), "me"), 1);
+        // the same announcement received again, e.g. via another interface
+        assert_eq!(responders.note(&resp(&["a"]), "me"), 1);
+        assert_eq!(responders.note(&resp(&["b"]), "me"), 2);
+    }
+
+    #[test]
+    fn own_responses_do_not_count() {
+        let mut responders = Responders::default();
+        assert_eq!(responders.note(&resp(&["me"]), "me"), 0);
+        assert_eq!(responders.note(&resp(&["me", "a"]), "me"), 1);
+    }
+
+    #[test]
+    fn multiple_peers_in_one_packet_all_count() {
+        let mut responders = Responders::default();
+        assert_eq!(responders.note(&resp(&["a", "b", "c"]), "me"), 3);
     }
 }
